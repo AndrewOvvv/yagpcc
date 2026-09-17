@@ -56,6 +56,7 @@ arch_config:
   queries_file: queries.json
   segments_file: segments.json
   max_file_size: 419430400
+  file_record_limit: 1048576
 ```
 
 A writer configuration section is available through [`WriterConfig`](../internal/config/config.go:54) and [`WriterTarget`](../internal/config/config.go:71). The list under `targets` is fanned out: each enabled target gets its own independent batch-processor pipeline (bounded queue, write timeout, drops), so a slow target never stalls or drops writes for the others. `targets[0]` must be an enabled `file` target.
@@ -72,6 +73,7 @@ writers:
       queries_file: queries.json
       segments_file: segments.json
       max_file_size: 419430400
+      file_record_limit: 1048576
 ```
 
 ### ClickHouse target
@@ -87,6 +89,7 @@ writers:
       queries_file: queries.json
       segments_file: segments.json
       max_file_size: 419430400
+      file_record_limit: 1048576
     - type: clickhouse
       enabled: true
       addrs: ["clickhouse-1:9000", "clickhouse-2:9000"]
@@ -103,8 +106,12 @@ An enabled `clickhouse` target requires a non-empty `addrs`; the password is rea
 ## File archive record size
 
 Each file archive event remains one JSON line. The file writer enforces a
-1 MiB (1,048,576 bytes) limit including the trailing newline, matching the
-Unified Agent `file_input.max_bytes_in_line: 1024kb` transport configuration.
+configurable `file_record_limit` in bytes, including the trailing newline.
+Set it under `arch_config` or on a file target in `writers.targets`; a nonzero
+target value takes precedence over `arch_config`. Omitted or zero values use
+the inherited limit, defaulting to 1 MiB (1,048,576 bytes). Negative values are
+rejected. Keep this limit at or below the downstream transport limit (currently
+Unified Agent `file_input.max_bytes_in_line: 1024kb`).
 `max_file_size` controls file rotation and does not change this record limit.
 
 Records that fit are emitted unchanged. For oversized records, only the

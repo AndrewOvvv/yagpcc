@@ -25,23 +25,35 @@ import (
 	"github.com/open-gpdb/yagpcc/internal/metrics"
 )
 
-// FileRecordLimit includes the trailing newline. Keep in sync with the
-// Unified Agent file_input max_bytes_in_line used for the file archive.
-const FileRecordLimit = 1 << 20
 const truncationMarker = "...[truncated]"
 
-type archiveText struct {
-	parent   map[string]interface{}
-	key      string
-	original string
+type truncatableTextField struct {
+	object       map[string]interface{}
+	fieldName    string
+	originalText string
+}
+
+func (fw *FileWriters) limitRecord(data []byte, stream string) ([]byte, error) {
+	result, truncated, err := limitArchiveJSON(data, fw.fileRecordLimit)
+	outcome := archiveRecordOutcome(truncated, err)
+
+	if outcome == "dropped" {
+		fw.logger.Warnf("dropping oversized %s archive record: bytes=%d: %v", stream, len(data), err)
+	}
+
+	if m := metrics.YagpccMetrics; m != nil && m.FileOversizedRecords != nil {
+		m.FileOversizedRecords.WithLabelValues(stream, outcome).Inc()
+	}
+	return result, err
 }
 
 // limitArchiveJSON only changes the serialized file copy. The same source
 // objects are concurrently consumed by other archive writers.
-func limitArchiveJSON(data []byte, limit int) ([]byte, bool, error) {
-	if len(data)+1 <= limit {
+func limitArchiveJSON(data []byte, limit int64) ([]byte, bool, error) {
+	if int64(len(data))+1 <= limit {
 		return data, false, nil
 	}
+
 	var record map[string]interface{}
 	dec := json.NewDecoder(bytes.NewReader(data))
 	// IDs and integer metrics must not pass through float64 (loss above 2^53).
@@ -49,87 +61,104 @@ func limitArchiveJSON(data []byte, limit int) ([]byte, bool, error) {
 	if err := dec.Decode(&record); err != nil {
 		return nil, false, err
 	}
-	var fields []archiveText
+
+	fields := collectTruncatableTextFields(record)
+	result, err := fitArchiveRecord(record, fields, limit)
+	if err != nil {
+		return nil, false, err
+	}
+	return result, true, nil
+}
+
+func collectTruncatableTextFields(record map[string]interface{}) []truncatableTextField {
 	groups := []struct {
-		parent string
-		keys   []string
+		objectName string
+		fieldNames []string
 	}{
 		{"GpStatInfo", []string{"Query"}},
 		{"RunningQueryInfo", []string{"QueryText", "PlanText"}},
 		{"queryInfo", []string{"queryText", "planText", "templateQueryText", "templatePlanText"}},
 	}
-	longest := 0
+
+	var fields []truncatableTextField
 	for _, group := range groups {
-		parent, ok := record[group.parent].(map[string]interface{})
+		object, ok := record[group.objectName].(map[string]interface{})
 		if !ok {
 			continue
 		}
-		for _, key := range group.keys {
-			value, ok := parent[key].(string)
-			if !ok || value == "" {
+		for _, name := range group.fieldNames {
+			text, ok := object[name].(string)
+			if !ok || text == "" {
 				continue
 			}
-			fields = append(fields, archiveText{parent, key, value})
-			if len(value) > longest {
-				longest = len(value)
-			}
+			fields = append(fields, truncatableTextField{
+				object: object, fieldName: name, originalText: text,
+			})
 		}
 	}
-	// A shared prefix budget preserves short fields while retaining prefixes
-	// of all large query/plan fields. Search against actual encoded JSON size.
-	encode := func(budget int) ([]byte, error) {
-		for _, field := range fields {
-			value := field.original
-			if len(value) > budget {
-				end := budget
-				for end > 0 && !utf8.RuneStart(value[end]) {
-					end--
-				}
-				value = value[:end] + truncationMarker
-			}
-			field.parent[field.key] = value
-		}
-		return json.Marshal(record)
-	}
-	best, err := encode(0)
-	if err != nil {
-		return nil, false, err
-	}
-	if len(best)+1 > limit {
-		return nil, false, fmt.Errorf("archive record exceeds %d bytes even after removing query/plan text", limit)
-	}
-	// Shorter fields can lose the marker at their full length, so the search
-	// guarantees a fitting result, not the maximum possible retained prefix.
-	low, high := 1, longest-1
-	for low <= high {
-		mid := low + (high-low)/2
-		candidate, err := encode(mid)
-		if err != nil {
-			return nil, false, err
-		}
-		if len(candidate)+1 <= limit {
-			best = candidate
-			low = mid + 1
-		} else {
-			high = mid - 1
-		}
-	}
-	return best, true, nil
+	return fields
 }
 
-func (fw *FileWriters) limitRecord(data []byte, stream string) ([]byte, error) {
-	result, truncated, err := limitArchiveJSON(data, FileRecordLimit)
-	outcome := "truncated"
-	if err != nil {
-		outcome = "dropped"
+func fitArchiveRecord(record map[string]interface{}, fields []truncatableTextField, limit int64) ([]byte, error) {
+	budget := 0
+	for _, field := range fields {
+		budget = max(budget, len(field.originalText))
 	}
-	if err != nil || truncated {
-		if m := metrics.YagpccMetrics; m != nil && m.FileOversizedRecords != nil {
-			m.FileOversizedRecords.WithLabelValues(stream, outcome).Inc()
-		}
+
+	for {
+		result, err := marshalArchiveWithTextBudget(record, fields, budget)
 		if err != nil {
-			fw.logger.Warnf("dropping oversized %s archive record: bytes=%d: %v", stream, len(data), err)
+			return nil, err
 		}
+		excess := int64(len(result)) + 1 - limit
+		if excess <= 0 {
+			return result, nil
+		}
+		if budget == 0 {
+			return nil, fmt.Errorf("archive record exceeds %d bytes even after removing query/plan text", limit)
+		}
+
+		affected := 0
+		for _, field := range fields {
+			if len(field.originalText) >= budget {
+				affected++
+			}
+		}
+		reduction := 1 + (excess-1)/int64(affected)
+		// excess counts JSON bytes, but budget counts source text bytes. Escaping
+		// can inflate excess, so subtracting it directly may discard all text.
+		// Halving is a conservative step: re-marshal before cutting further.
+		// Allow a one-byte step so a budget of 1 can still reach zero.
+		reduction = min(reduction, int64(max(1, budget/2)))
+		budget -= int(reduction)
 	}
-	return result, err
+}
+
+func marshalArchiveWithTextBudget(record map[string]interface{}, fields []truncatableTextField, budget int) ([]byte, error) {
+	for _, field := range fields {
+		field.object[field.fieldName] = truncateArchiveText(field.originalText, budget)
+	}
+	return json.Marshal(record)
+}
+
+// budget counts original text bytes, excluding the marker and JSON escaping.
+func truncateArchiveText(text string, budget int) string {
+	if len(text) <= budget {
+		return text
+	}
+	end := budget
+	for end > 0 && !utf8.RuneStart(text[end]) {
+		end--
+	}
+	return text[:end] + truncationMarker
+}
+
+func archiveRecordOutcome(truncated bool, err error) string {
+	if err != nil {
+		return "dropped"
+	}
+	if truncated {
+		return "truncated"
+	}
+	return "unchanged"
 }

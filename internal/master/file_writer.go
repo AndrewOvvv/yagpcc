@@ -18,6 +18,7 @@ package master
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"sync"
@@ -25,6 +26,7 @@ import (
 	"google.golang.org/protobuf/encoding/protojson"
 
 	pbm "github.com/open-gpdb/yagpcc/api/proto/agent_master"
+	"github.com/open-gpdb/yagpcc/internal/config"
 	"github.com/open-gpdb/yagpcc/internal/gp"
 	"github.com/open-gpdb/yagpcc/internal/interfaces"
 	"go.uber.org/zap"
@@ -32,14 +34,21 @@ import (
 
 // FileWriters implements ArchiveWriter interface using rotating JSONL files.
 type FileWriters struct {
-	logger        *zap.SugaredLogger
-	sessionWriter io.Writer
-	queryWriter   io.Writer
-	segmentWriter io.Writer
+	logger          *zap.SugaredLogger
+	fileRecordLimit int64
+	sessionWriter   io.Writer
+	queryWriter     io.Writer
+	segmentWriter   io.Writer
 }
 
 // NewFileWriters creates a new FileWriters instance with rotating file writers.
-func NewFileWriters(logger *zap.SugaredLogger, sessionsFile, queriesFile, segmentsFile string, maxFileSize int64) (*FileWriters, error) {
+func NewFileWriters(logger *zap.SugaredLogger, sessionsFile, queriesFile, segmentsFile string, maxFileSize int64, fileRecordLimit int64) (*FileWriters, error) {
+	if fileRecordLimit < 0 {
+		return nil, fmt.Errorf("file_record_limit must be >= 0")
+	}
+	if fileRecordLimit == 0 {
+		fileRecordLimit = config.DefaultArchiverConfig().FileRecordLimit
+	}
 	sessionWriter, err := NewRotateWriter(sessionsFile, maxFileSize)
 	if err != nil {
 		return nil, err
@@ -54,10 +63,11 @@ func NewFileWriters(logger *zap.SugaredLogger, sessionsFile, queriesFile, segmen
 	}
 
 	return &FileWriters{
-		logger:        logger,
-		sessionWriter: sessionWriter,
-		queryWriter:   queryWriter,
-		segmentWriter: segmentWriter,
+		logger:          logger,
+		fileRecordLimit: fileRecordLimit,
+		sessionWriter:   sessionWriter,
+		queryWriter:     queryWriter,
+		segmentWriter:   segmentWriter,
 	}, nil
 }
 

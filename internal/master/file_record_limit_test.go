@@ -20,6 +20,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -69,7 +72,7 @@ func TestArchiveJSONLimit(t *testing.T) {
 func TestArchiveJSONBoundary(t *testing.T) {
 	in := []byte(`{"GpStatInfo":{"Query":"` + strings.Repeat("x", 200) + `"}}`)
 	for _, limit := range []int{len(in) + 2, len(in) + 1, len(in)} {
-		out, changed, err := limitArchiveJSON(in, limit)
+		out, changed, err := limitArchiveJSON(in, int64(limit))
 		require.NoError(t, err)
 		require.LessOrEqual(t, len(out)+1, limit)
 		require.Equal(t, limit < len(in)+1, changed)
@@ -88,7 +91,7 @@ func TestArchiveJSONDoesNotTruncateOtherFields(t *testing.T) {
 
 func TestFileWriterLimitsAllStreamsAndPreservesSource(t *testing.T) {
 	ctx := context.Background()
-	text := strings.Repeat("🙂\"\\", FileRecordLimit/4)
+	text := strings.Repeat("🙂\"\\", (1<<20)/4)
 	session := &gp.SessionDataWrite{
 		GpStatInfo:       &gp.GpStatActivity{Query: &text},
 		RunningQueryInfo: &gp.QueryInfoShort{QueryText: text, PlanText: text, QueryID: 18446744073709551615},
@@ -96,7 +99,7 @@ func TestFileWriterLimitsAllStreamsAndPreservesSource(t *testing.T) {
 	query := &pbm.QueryStatWrite{QueryInfo: &pbc.QueryInfo{QueryText: text, PlanText: text, TemplateQueryText: text, TemplatePlanText: text}}
 	segment := &pbm.SegmentMetricsWrite{QueryInfo: query.QueryInfo}
 	var sessions, queries, segments bytes.Buffer
-	fw := &FileWriters{logger: zap.NewNop().Sugar(), sessionWriter: &sessions, queryWriter: &queries, segmentWriter: &segments}
+	fw := &FileWriters{fileRecordLimit: (1 << 20), logger: zap.NewNop().Sugar(), sessionWriter: &sessions, queryWriter: &queries, segmentWriter: &segments}
 	beforeSession, err := session.ToJSON()
 	require.NoError(t, err)
 	beforeQuery, err := (&QueryStatWriteSerializable{v: query}).ToJSON()
@@ -108,7 +111,7 @@ func TestFileWriterLimitsAllStreamsAndPreservesSource(t *testing.T) {
 		require.True(t, bytes.HasSuffix(buf.Bytes(), []byte{'\n'}))
 		for _, line := range bytes.Split(bytes.TrimSuffix(buf.Bytes(), []byte{'\n'}), []byte{'\n'}) {
 			require.True(t, json.Valid(line))
-			require.LessOrEqual(t, len(line)+1, FileRecordLimit)
+			require.LessOrEqual(t, len(line)+1, (1 << 20))
 			require.Contains(t, string(line), truncationMarker)
 		}
 	}
@@ -124,11 +127,40 @@ func TestFileWriterLimitsAllStreamsAndPreservesSource(t *testing.T) {
 
 func TestFileWriterContinuesAfterUntrimmableRecord(t *testing.T) {
 	var out bytes.Buffer
-	fw := &FileWriters{logger: zap.NewNop().Sugar(), queryWriter: &out}
+	fw := &FileWriters{fileRecordLimit: (1 << 20), logger: zap.NewNop().Sugar(), queryWriter: &out}
 	require.NoError(t, fw.StoreQuery(context.Background(), []*pbm.QueryStatWrite{
-		{Message: strings.Repeat("x", FileRecordLimit)},
+		{Message: strings.Repeat("x", (1 << 20))},
 		{QueryInfo: &pbc.QueryInfo{QueryText: "select 1"}},
 	}))
 	require.Equal(t, 1, bytes.Count(out.Bytes(), []byte{'\n'}))
 	require.Contains(t, out.String(), "select 1")
+}
+
+func TestFileWriterConfiguredRecordLimit(t *testing.T) {
+	for _, limit := range []int64{0, 4096, 2 * (1 << 20), 1 << 32} {
+		t.Run(fmt.Sprint(limit), func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "queries.json")
+			fw, err := NewFileWriters(zap.NewNop().Sugar(), filepath.Join(dir, "sessions.json"), path, filepath.Join(dir, "segments.json"), 8<<20, limit)
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, fw.Close()) })
+			text := strings.Repeat("x", (1<<20)+100)
+			require.NoError(t, fw.StoreQuery(context.Background(), []*pbm.QueryStatWrite{{QueryInfo: &pbc.QueryInfo{QueryText: text}}}))
+			out, err := os.ReadFile(path)
+			require.NoError(t, err)
+			require.NotEmpty(t, out)
+			require.True(t, json.Valid(out))
+			effectiveLimit := limit
+			if effectiveLimit == 0 {
+				effectiveLimit = (1 << 20)
+			}
+			require.LessOrEqual(t, int64(len(out)), effectiveLimit)
+			if limit > (1 << 20) {
+				require.Contains(t, string(out), text)
+				require.Greater(t, len(out), (1 << 20))
+			} else {
+				require.Contains(t, string(out), truncationMarker)
+			}
+		})
+	}
 }
