@@ -131,9 +131,9 @@ A record that still cannot fit after shortening the allowed fields is skipped,
 with a warning containing its stream and size (not its contents). Later records
 in the batch are still processed.
 
-`file_oversized_records_total{stream="sessions|queries|segments", outcome="truncated|dropped"}`
-counts records shortened or rejected by the file size guard. A `truncated`
-outcome describes preparation of the record, not confirmation of delivery.
+`file_archive_records_total{stream="sessions|queries|segments", outcome="unchanged|truncated|dropped"}`
+counts all records checked by the file size guard, including unchanged records.
+Outcomes describe size-limit processing, not confirmation of delivery.
 Already truncated historical records cannot be recovered by this change.
 
 ## Metrics

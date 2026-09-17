@@ -278,9 +278,9 @@ func InitMetrics() {
 			Name: "writer_processed_messages_total",
 			Help: "Total number of messages successfully processed by writer pipeline",
 		}, []string{"stream", "target"}),
-		FileOversizedRecords: promauto.NewCounterVec(prometheus.CounterOpts{
-			Name: "file_oversized_records_total",
-			Help: "Oversized file archive records by stream and outcome (truncated or dropped).",
+		FileArchiveRecords: promauto.NewCounterVec(prometheus.CounterOpts{
+			Name: "file_archive_records_total",
+			Help: "File archive records by stream and size-limit outcome (unchanged, truncated, or dropped).",
 		}, []string{"stream", "outcome"}),
 		WriterDroppedMessages: promauto.NewCounterVec(prometheus.CounterOpts{
 			Name: "writer_dropped_messages_total",

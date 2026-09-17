@@ -41,8 +41,8 @@ func (fw *FileWriters) limitRecord(data []byte, stream string) ([]byte, error) {
 		fw.logger.Warnf("dropping oversized %s archive record: bytes=%d: %v", stream, len(data), err)
 	}
 
-	if m := metrics.YagpccMetrics; m != nil && m.FileOversizedRecords != nil {
-		m.FileOversizedRecords.WithLabelValues(stream, outcome).Inc()
+	if m := metrics.YagpccMetrics; m != nil && m.FileArchiveRecords != nil {
+		m.FileArchiveRecords.WithLabelValues(stream, outcome).Inc()
 	}
 	return result, err
 }
